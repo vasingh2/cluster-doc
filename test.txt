@@ -1,0 +1,229 @@
+import gevent
+from gevent import monkey, lock, pool
+import requests
+import time
+import argparse
+import random
+import string
+import json
+import logging
+import csv
+from datetime import datetime
+
+# Apply monkey patching for non-blocking requests
+monkey.patch_all()
+
+# Configure JSON Logger
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": record.levelname,
+            "message": record.getMessage(),
+        }
+        if record.args:
+            log_entry.update(record.args)
+        return json.dumps(log_entry)
+
+logger = logging.getLogger("LoadTester")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(JSONFormatter())
+logger.addHandler(handler)
+
+class LoadTester:
+    def __init__(self, url, rps, concurrency, payload_length, duration=None, iterations=None):
+        self.url = url
+        self.rps = rps
+        self.concurrency = concurrency
+        self.payload_length = payload_length
+        self.duration = duration
+        self.iterations = iterations
+
+        if self.duration is None and self.iterations is None:
+            raise ValueError("Either 'duration' or 'iterations' must be provided.")
+
+        # Global Counters
+        self.total_requests = 0
+        self.success_count = 0
+        self.error_count = 0
+        self.response_times = []
+        self.status_codes = {}
+        self.failed_requests = []
+        self.start_time = None
+        self.end_time = None
+        self.first_error_time = None
+
+        # Lock for thread safety
+        self.counter_lock = lock.BoundedSemaphore()
+
+        # Dynamic Pool for Concurrency Control
+        self.thread_pool = pool.Pool(self.concurrency)
+
+        # Thread Tracking
+        self.current_threads = 0
+        self.max_threads = 0
+        self.min_threads = float("inf")
+
+    def generate_payload(self):
+        """Generate a random payload of the specified length."""
+        return ''.join(random.choices(string.ascii_letters + string.digits, k=self.payload_length))
+
+    def send_request(self, request_id):
+        """Send a request asynchronously while maintaining RPS."""
+        self.current_threads += 1
+        self.max_threads = max(self.max_threads, self.current_threads)
+        self.min_threads = min(self.min_threads, self.current_threads)
+
+        payload = self.generate_payload()
+        start_time = time.time()
+
+        try:
+            response = requests.post(self.url, json={"data": payload}, headers={"Content-Type": "application/json"})
+            elapsed_time = time.time() - start_time
+
+            with self.counter_lock:
+                self.total_requests += 1
+                self.response_times.append(elapsed_time)
+                self.status_codes[response.status_code] = self.status_codes.get(response.status_code, 0) + 1
+
+                if response.status_code == 200:
+                    self.success_count += 1
+                else:
+                    self.error_count += 1
+                    self.failed_requests.append(request_id)
+                    if not self.first_error_time:
+                        self.first_error_time = datetime.utcnow()
+                    logger.error("Non-200 Response", extra={"request_id": request_id, "status_code": response.status_code})
+
+                # Log each request result
+                logger.info("Request Completed", extra={
+                    "request_id": request_id,
+                    "status_code": response.status_code,
+                    "response_time": elapsed_time
+                })
+
+        except Exception as e:
+            with self.counter_lock:
+                self.total_requests += 1
+                self.error_count += 1
+                self.failed_requests.append(request_id)
+                self.status_codes["Exception"] = self.status_codes.get("Exception", 0) + 1
+                if not self.first_error_time:
+                    self.first_error_time = datetime.utcnow()
+                logger.error("Request Failed", extra={"request_id": request_id, "error": str(e)})
+
+        self.current_threads -= 1  # Decrease active thread count
+
+    def worker(self):
+        """Continuously send requests to maintain RPS."""
+        iterations_completed = 0
+        start_time = time.time()
+
+        while True:
+            if self.duration and (time.time() - start_time) > self.duration:
+                break
+            if self.iterations and iterations_completed >= self.iterations:
+                break
+
+            # Spawn a request in the thread pool if there's space
+            if not self.thread_pool.full():
+                request_id = self.total_requests + 1
+                self.thread_pool.spawn(self.send_request, request_id)
+            else:
+                logger.warning("Thread pool full, delaying request.", extra={})
+
+            iterations_completed += 1
+            gevent.sleep(1 / self.rps)  # Maintain exact RPS
+
+    def start_test(self):
+        """Start the load test with RPS priority."""
+        self.start_time = datetime.utcnow()
+        logger.info("Starting Load Test", extra={
+            "url": self.url,
+            "rps": self.rps,
+            "concurrency": self.concurrency,
+            "payload_length": self.payload_length,
+            "duration": self.duration,
+            "iterations": self.iterations,
+            "start_timestamp": self.start_time.isoformat()
+        })
+
+        # Start Workers
+        worker_threads = [gevent.spawn(self.worker) for _ in range(self.concurrency)]
+        gevent.joinall(worker_threads)
+
+        # Save results
+        self.end_time = datetime.utcnow()
+        self.log_results()
+        self.save_results_to_csv()
+
+        logger.info("Load Test Completed", extra={
+            "max_threads": self.max_threads,
+            "min_threads": self.min_threads,
+            "total_requests": self.total_requests,
+            "success_count": self.success_count,
+            "error_count": self.error_count
+        })
+
+    def log_results(self):
+        """Print final results as JSON."""
+        elapsed_time = (self.end_time - self.start_time).total_seconds()
+        throughput = self.total_requests / elapsed_time if elapsed_time > 0 else 0
+        avg_response_time = sum(self.response_times) / len(self.response_times) if self.response_times else 0
+        p95_latency = sorted(self.response_times)[int(len(self.response_times) * 0.95) - 1] if self.response_times else 0
+        min_response_time = min(self.response_times, default=0)
+        max_response_time = max(self.response_times, default=0)
+        first_error_elapsed_time = (self.first_error_time - self.start_time).total_seconds() if self.first_error_time else None
+
+        results = {
+            "timestamp": self.end_time.isoformat(),
+            "total_requests": self.total_requests,
+            "success_count": self.success_count,
+            "error_count": self.error_count,
+            "avg_response_time": avg_response_time,
+            "min_response_time": min_response_time,
+            "max_response_time": max_response_time,
+            "p95_latency": p95_latency,
+            "throughput": throughput,
+            "max_threads": self.max_threads,
+            "min_threads": self.min_threads,
+            "status_codes": self.status_codes,
+            "failed_requests": self.failed_requests,
+            "total_duration": elapsed_time,
+            "first_error_timestamp": self.first_error_time.isoformat() if self.first_error_time else None,
+            "first_error_elapsed_time": first_error_elapsed_time
+        }
+        logger.info("Final Test Results", extra=results)
+
+    def save_results_to_csv(self):
+        """Save test results to CSV file."""
+        csv_file = "metrics.csv"
+        with open(csv_file, mode="w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["Timestamp", "Total Requests", "Success Count", "Error Count", "Avg Latency", "Min Latency", "Max Latency", "P95 Latency", "Throughput", "Max Threads", "Min Threads"])
+            writer.writerow([self.end_time.isoformat(), self.total_requests, self.success_count, self.error_count, sum(self.response_times) / len(self.response_times) if self.response_times else 0, min(self.response_times, default=0), max(self.response_times, default=0), sorted(self.response_times)[int(len(self.response_times) * 0.95) - 1] if self.response_times else 0, self.total_requests / (self.end_time - self.start_time).total_seconds() if self.end_time and self.start_time else 0, self.max_threads, self.min_threads])
+
+        logger.info(f"Metrics saved to {csv_file}")
+
+
+# ** CLI Mode Support **
+def run_cli(url, rps, concurrency, payload_length, duration, iterations):
+    tester = LoadTester(url, rps, concurrency, payload_length, duration, iterations)
+    tester.start_test()
+
+# ** MAIN ENTRY POINT **
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="CLI Load Tester with JSON Logging")
+    parser.add_argument('--url', type=str, required=True, help="Target API URL")
+    parser.add_argument('--rps', type=int, required=True, help="Requests Per Second (RPS)")
+    parser.add_argument('--concurrency', type=int, required=True, help="Maximum Concurrent Threads")
+    parser.add_argument('--payload-length', type=int, required=True, help="Payload size in bytes")
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--duration', type=int, help="Test duration in seconds")
+    group.add_argument('--iterations', type=int, help="Number of iterations")
+
+    args = parser.parse_args()
+
+    run_cli(args.url, args.rps, args.concurrency, args.payload_length, args.duration, args.iterations)
